@@ -97,39 +97,40 @@ class VaultManager:
     async def _atomic_write(self, file_path: Path, content: str) -> None:
         """
         Atomically write content to a file using temp file + rename.
-        
+
         Args:
             file_path: Target file path
             content: Content to write
-            
+
         Raises:
             VaultOperationError: If write fails
         """
         try:
-            # Create parent directories if needed
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            
+            # Create parent directories if needed (offload to thread to avoid blocking)
+            await asyncio.to_thread(file_path.parent.mkdir, parents=True, exist_ok=True)
+
             # Create temporary file in the same directory for atomic rename
-            temp_fd, temp_path = tempfile.mkstemp(
+            temp_fd, temp_path = await asyncio.to_thread(
+                tempfile.mkstemp,
                 dir=file_path.parent,
                 prefix=f".{file_path.name}.tmp",
-                suffix=".md"
+                suffix=".md",
             )
-            
+
             try:
                 # Write content to temp file
                 async with aiofiles.open(temp_fd, "w", encoding="utf-8", closefd=False) as f:
                     await f.write(content)
                     await f.flush()
-                    # Force write to disk for durability
-                    os.fsync(temp_fd)
-                
-                # Close the file descriptor
-                os.close(temp_fd)
-                
-                # Atomically replace the target file
-                os.replace(temp_path, file_path)
-                
+                    # Force write to disk for durability (offload to thread)
+                    await asyncio.to_thread(os.fsync, temp_fd)
+
+                # Close the file descriptor (offload to thread)
+                await asyncio.to_thread(os.close, temp_fd)
+
+                # Atomically replace the target file (offload to thread)
+                await asyncio.to_thread(os.replace, temp_path, file_path)
+
             except Exception:
                 # Clean up temp file on error
                 try:
@@ -141,13 +142,13 @@ class VaultManager:
                 except OSError:
                     pass
                 raise
-                
+
         except Exception as e:
             raise VaultOperationError(f"Failed to write file atomically: {e}")
 
-    async def read_note(self, path: str) -> Note:
+    async def _read_note_unlocked(self, path: str) -> Note:
         """
-        Read a note from the vault.
+        Read a note without acquiring a lock. Caller must already hold the lock.
 
         Args:
             path: Relative path to the note
@@ -163,52 +164,67 @@ class VaultManager:
         if not await aiofiles.os.path.exists(file_path):
             raise VaultOperationError(f"Note not found: {path}")
 
+        try:
+            # Read file content
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                content = await f.read()
+
+            # Get file stats
+            stat = await aiofiles.os.stat(file_path)
+
+            # Parse Obsidian features
+            frontmatter_dict, _ = ObsidianParser.extract_frontmatter(content)
+            tags = ObsidianParser.extract_tags(content)
+            links = ObsidianParser.extract_wiki_links(content)
+
+            # Create metadata using normalized path
+            metadata = NoteMetadata(
+                path=normalized_path,
+                name=file_path.name,
+                size=stat.st_size,
+                created=datetime.fromtimestamp(stat.st_ctime),
+                modified=datetime.fromtimestamp(stat.st_mtime),
+                extension=file_path.suffix.lstrip("."),
+            )
+
+            # Parse frontmatter into Pydantic model if exists
+            from .models import Frontmatter
+
+            frontmatter = None
+            if frontmatter_dict:
+                frontmatter = Frontmatter(**frontmatter_dict)
+
+            note = Note(
+                metadata=metadata,
+                content=content,
+                frontmatter=frontmatter,
+                tags=tags,
+                links=links,
+                backlinks=[],  # Backlinks computed separately
+            )
+
+            logger.debug(f"Successfully read note: {normalized_path}")
+            return note
+
+        except Exception as e:
+            logger.error(f"Error reading note {path}: {e}")
+            raise VaultOperationError(f"Failed to read note: {e}")
+
+    async def read_note(self, path: str) -> Note:
+        """
+        Read a note from the vault.
+
+        Args:
+            path: Relative path to the note
+
+        Returns:
+            Note object with metadata and content
+
+        Raises:
+            VaultOperationError: If note cannot be read
+        """
         async with self._get_lock(path):
-            try:
-                # Read file content
-                async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-                    content = await f.read()
-
-                # Get file stats
-                stat = await aiofiles.os.stat(file_path)
-
-                # Parse Obsidian features
-                frontmatter_dict, _ = ObsidianParser.extract_frontmatter(content)
-                tags = ObsidianParser.extract_tags(content)
-                links = ObsidianParser.extract_wiki_links(content)
-
-                # Create metadata using normalized path
-                metadata = NoteMetadata(
-                    path=normalized_path,
-                    name=file_path.name,
-                    size=stat.st_size,
-                    created=datetime.fromtimestamp(stat.st_ctime),
-                    modified=datetime.fromtimestamp(stat.st_mtime),
-                    extension=file_path.suffix.lstrip("."),
-                )
-
-                # Parse frontmatter into Pydantic model if exists
-                from .models import Frontmatter
-
-                frontmatter = None
-                if frontmatter_dict:
-                    frontmatter = Frontmatter(**frontmatter_dict)
-
-                note = Note(
-                    metadata=metadata,
-                    content=content,
-                    frontmatter=frontmatter,
-                    tags=tags,
-                    links=links,
-                    backlinks=[],  # Backlinks computed separately
-                )
-
-                logger.debug(f"Successfully read note: {normalized_path}")
-                return note
-
-            except Exception as e:
-                logger.error(f"Error reading note {path}: {e}")
-                raise VaultOperationError(f"Failed to read note: {e}")
+            return await self._read_note_unlocked(path)
 
     async def create_note(
         self, path: str, content: str, frontmatter: Optional[Dict] = None
@@ -252,8 +268,8 @@ class VaultManager:
 
                 logger.info(f"Created note: {normalized_path}")
 
-                # Read and return the created note
-                return await self.read_note(normalized_path)
+                # Read and return the created note (already holding lock)
+                return await self._read_note_unlocked(normalized_path)
 
             except Exception as e:
                 logger.error(f"Error creating note {normalized_path}: {e}")
@@ -335,8 +351,8 @@ class VaultManager:
 
                 logger.info(f"Updated note: {normalized_path}")
 
-                # Read and return the updated note
-                return await self.read_note(normalized_path)
+                # Read and return the updated note (already holding lock)
+                return await self._read_note_unlocked(normalized_path)
 
             except Exception as e:
                 logger.error(f"Error updating note {normalized_path}: {e}")
